@@ -23,8 +23,8 @@
         <maven.compiler.source>17</maven.compiler.source>
         <maven.compiler.target>17</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-        <sonar.organization>your-org</sonar.organization>
-        <sonar.host.url>https://sonarqube.company.com</sonar.host.url>
+        <sonar.organization>rraoblr11</sonar.organization>
+        <sonar.host.url>https://sonarcloud.io</sonar.host.url>
         <jacoco.version>0.8.11</jacoco.version>
     </properties>
     
