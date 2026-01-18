@@ -66,10 +66,11 @@ jobs:
       
       # Dependency Vulnerability Scanning
       - name: OWASP Dependency Check
+        continue-on-error: true
         run: |
           mvn org.owasp:dependency-check-maven:check \
             -DfailBuildOnCVSS=7 \
-            -DsuppressionFiles=.dependency-check-suppressions.xml || true
+            -DnvdApiKey=${{ secrets.NVD_API_KEY }}
       
       - name: Upload Dependency Check Results
         if: always()
