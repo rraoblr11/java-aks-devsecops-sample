@@ -1,0 +1,628 @@
+name: Java AKS DevSecOps CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+      - release/*
+  pull_request:
+    branches:
+      - main
+      - develop
+  workflow_dispatch:
+
+env:
+  JAVA_VERSION: '17'
+  MAVEN_OPTS: '-Xmx3072m'
+  AZURE_RESOURCE_GROUP: 'rg-aks-prod'
+  AKS_CLUSTER_NAME: 'aks-prod-cluster'
+  ACR_NAME: 'acrprodregistry'
+  APP_NAME: 'java-app'
+  NAMESPACE: 'production'
+  SONAR_HOST_URL: 'https://sonarqube.company.com'
+  TRIVY_VERSION: '0.48.0'
+  KUBESCAPE_VERSION: '3.0.3'
+
+jobs:
+  # ============================================================================
+  # JOB 1: CODE QUALITY & SECURITY SCANNING
+  # ============================================================================
+  code-security-scan:
+    name: Code Quality & Security Analysis
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      pull-requests: write
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for SonarQube analysis
+      
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: 'maven'
+      
+      # SAST - Static Application Security Testing
+      - name: SAST - SonarQube Scan
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ env.SONAR_HOST_URL }}
+        run: |
+          mvn clean verify sonar:sonar \
+            -Dsonar.projectKey=${{ env.APP_NAME }} \
+            -Dsonar.host.url=${{ env.SONAR_HOST_URL }} \
+            -Dsonar.login=${{ secrets.SONAR_TOKEN }} \
+            -Dsonar.qualitygate.wait=true \
+            -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml \
+            -Dsonar.java.binaries=target/classes
+      
+      # Dependency Vulnerability Scanning
+      - name: OWASP Dependency Check
+        uses: dependency-check/Dependency-Check_Action@main
+        with:
+          project: ${{ env.APP_NAME }}
+          path: '.'
+          format: 'ALL'
+          args: >
+            --enableRetired
+            --enableExperimental
+            --failOnCVSS 7
+      
+      - name: Upload Dependency Check Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-check-report
+          path: reports/
+      
+      # Secret Scanning
+      - name: GitLeaks Secret Scan
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+      
+      # License Compliance Check
+      - name: License Compliance Check
+        run: |
+          mvn license:add-third-party
+          mvn license:aggregate-download-licenses
+      
+      - name: Upload License Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: license-report
+          path: target/generated-sources/license/
+  
+  # ============================================================================
+  # JOB 2: BUILD & UNIT TESTS
+  # ============================================================================
+  build-and-test:
+    name: Build & Unit Tests
+    runs-on: ubuntu-latest
+    needs: code-security-scan
+    permissions:
+      contents: read
+      checks: write
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: 'maven'
+      
+      - name: Build with Maven
+        run: |
+          mvn clean package -DskipTests
+      
+      - name: Run Unit Tests
+        run: |
+          mvn test
+      
+      - name: Run Integration Tests
+        run: |
+          mvn verify -DskipUnitTests
+      
+      - name: Generate Code Coverage Report
+        run: |
+          mvn jacoco:report
+      
+      - name: Publish Test Results
+        uses: EnricoMi/publish-unit-test-result-action@v2
+        if: always()
+        with:
+          files: |
+            target/surefire-reports/*.xml
+            target/failsafe-reports/*.xml
+      
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: java-app-jar
+          path: target/*.jar
+          retention-days: 7
+  
+  # ============================================================================
+  # JOB 3: DOCKER BUILD & CONTAINER SECURITY SCANNING
+  # ============================================================================
+  docker-build-scan:
+    name: Docker Build & Security Scan
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    permissions:
+      contents: read
+      security-events: write
+      packages: write
+    
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+      image-digest: ${{ steps.build.outputs.digest }}
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: Download Build Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: java-app-jar
+          path: target/
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Log in to Azure Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.ACR_NAME }}.azurecr.io
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+      
+      - name: Extract Docker Metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.ACR_NAME }}.azurecr.io/${{ env.APP_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+      
+      - name: Build Docker Image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          load: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            JAR_FILE=target/*.jar
+            JAVA_VERSION=${{ env.JAVA_VERSION }}
+      
+      # Container Image Scanning - Trivy
+      - name: Run Trivy Vulnerability Scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.ACR_NAME }}.azurecr.io/${{ env.APP_NAME }}:${{ github.sha }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH,MEDIUM'
+          exit-code: '1'
+          ignore-unfixed: true
+      
+      - name: Upload Trivy Results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+      
+      # Container Image Scanning - Grype
+      - name: Run Grype Vulnerability Scanner
+        uses: anchore/scan-action@v3
+        id: grype
+        with:
+          image: ${{ env.ACR_NAME }}.azurecr.io/${{ env.APP_NAME }}:${{ github.sha }}
+          fail-build: true
+          severity-cutoff: high
+          output-format: sarif
+      
+      - name: Upload Grype Results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: ${{ steps.grype.outputs.sarif }}
+      
+      # Container Best Practices - Dockle
+      - name: Run Dockle Security Linter
+        uses: erzz/dockle-action@v1
+        with:
+          image: ${{ env.ACR_NAME }}.azurecr.io/${{ env.APP_NAME }}:${{ github.sha }}
+          exit-code: '1'
+          exit-level: WARN
+      
+      # Sign Image with Cosign
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+      
+      - name: Sign Container Image
+        env:
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+        run: |
+          cosign sign --key env://COSIGN_PRIVATE_KEY \
+            ${{ env.ACR_NAME }}.azurecr.io/${{ env.APP_NAME }}:${{ github.sha }}
+      
+      # Push Image to ACR after all scans pass
+      - name: Push Docker Image to ACR
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          build-args: |
+            JAR_FILE=target/*.jar
+            JAVA_VERSION=${{ env.JAVA_VERSION }}
+      
+      - name: Generate SBOM (Software Bill of Materials)
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.ACR_NAME }}.azurecr.io/${{ env.APP_NAME }}:${{ github.sha }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+      
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.spdx.json
+  
+  # ============================================================================
+  # JOB 4: KUBERNETES MANIFEST SECURITY SCANNING
+  # ============================================================================
+  k8s-manifest-scan:
+    name: Kubernetes Manifest Security Scan
+    runs-on: ubuntu-latest
+    needs: docker-build-scan
+    permissions:
+      contents: read
+      security-events: write
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      
+      # Kubesec - K8s Security Risk Analysis
+      - name: Run Kubesec Scanner
+        uses: controlplaneio/kubesec-action@v0.0.2
+        with:
+          input: k8s/deployment.yaml
+          format: sarif
+          output: kubesec-results.sarif
+      
+      - name: Upload Kubesec Results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: kubesec-results.sarif
+      
+      # Kubescape - K8s Security Posture
+      - name: Run Kubescape Scanner
+        uses: kubescape/github-action@main
+        with:
+          files: "k8s/*.yaml"
+          frameworks: |
+            nsa,mitre,armobest
+          failedThreshold: 70
+          severityThreshold: medium
+      
+      # Checkov - IaC Security Scanner
+      - name: Run Checkov Scanner
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: k8s/
+          framework: kubernetes
+          output_format: sarif
+          output_file_path: checkov-results.sarif
+          soft_fail: false
+      
+      - name: Upload Checkov Results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: checkov-results.sarif
+      
+      # Datree - K8s Policy Enforcement
+      - name: Run Datree Policy Check
+        uses: datreeio/action-datree@main
+        with:
+          path: k8s/*.yaml
+          cliArguments: --only-k8s-files --policy-config /path/to/policy.yaml
+        env:
+          DATREE_TOKEN: ${{ secrets.DATREE_TOKEN }}
+  
+  # ============================================================================
+  # JOB 5: DEPLOY TO AKS STAGING
+  # ============================================================================
+  deploy-staging:
+    name: Deploy to AKS Staging
+    runs-on: ubuntu-latest
+    needs: [docker-build-scan, k8s-manifest-scan]
+    environment:
+      name: staging
+      url: https://staging.company.com
+    permissions:
+      contents: read
+      id-token: write
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: Azure Login (OIDC)
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      
+      - name: Set AKS Context
+        uses: azure/aks-set-context@v3
+        with:
+          resource-group: ${{ env.AZURE_RESOURCE_GROUP }}
+          cluster-name: ${{ env.AKS_CLUSTER_NAME }}
+      
+      - name: Create Namespace if not exists
+        run: |
+          kubectl create namespace staging --dry-run=client -o yaml | kubectl apply -f -
+      
+      - name: Create Image Pull Secret
+        run: |
+          kubectl create secret docker-registry acr-secret \
+            --docker-server=${{ env.ACR_NAME }}.azurecr.io \
+            --docker-username=${{ secrets.ACR_USERNAME }} \
+            --docker-password=${{ secrets.ACR_PASSWORD }} \
+            --namespace=staging \
+            --dry-run=client -o yaml | kubectl apply -f -
+      
+      - name: Deploy to AKS Staging
+        uses: azure/k8s-deploy@v4
+        with:
+          namespace: staging
+          manifests: |
+            k8s/namespace.yaml
+            k8s/configmap.yaml
+            k8s/secret.yaml
+            k8s/deployment.yaml
+            k8s/service.yaml
+            k8s/ingress.yaml
+            k8s/hpa.yaml
+            k8s/pdb.yaml
+            k8s/networkpolicy.yaml
+          images: |
+            ${{ env.ACR_NAME }}.azurecr.io/${{ env.APP_NAME }}:${{ github.sha }}
+          imagepullsecrets: |
+            acr-secret
+          strategy: canary
+          percentage: 20
+          traffic-split-method: pod
+      
+      - name: Verify Deployment
+        run: |
+          kubectl rollout status deployment/${{ env.APP_NAME }} -n staging --timeout=5m
+          kubectl get pods -n staging -l app=${{ env.APP_NAME }}
+      
+      # Runtime Security Scanning
+      - name: Run Falco Runtime Security Check
+        run: |
+          kubectl apply -f https://raw.githubusercontent.com/falcosecurity/falco/master/examples/k8s-using-daemonset/falco-daemonset-configmap.yaml
+          sleep 30
+          kubectl logs -n falco -l app=falco --tail=100
+  
+  # ============================================================================
+  # JOB 6: SMOKE TESTS
+  # ============================================================================
+  smoke-tests:
+    name: Smoke Tests
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: Wait for Application Ready
+        run: |
+          sleep 30
+      
+      - name: Run Health Check
+        run: |
+          curl -f https://staging.company.com/actuator/health || exit 1
+      
+      - name: Run Smoke Tests
+        run: |
+          mvn test -Dtest=SmokeTest -Denv=staging
+  
+  # ============================================================================
+  # JOB 7: DEPLOY TO AKS PRODUCTION (Manual Approval Required)
+  # ============================================================================
+  deploy-production:
+    name: Deploy to AKS Production
+    runs-on: ubuntu-latest
+    needs: smoke-tests
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: production
+      url: https://app.company.com
+    permissions:
+      contents: read
+      id-token: write
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: Azure Login (OIDC)
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      
+      - name: Set AKS Context
+        uses: azure/aks-set-context@v3
+        with:
+          resource-group: ${{ env.AZURE_RESOURCE_GROUP }}
+          cluster-name: ${{ env.AKS_CLUSTER_NAME }}
+      
+      - name: Create Namespace if not exists
+        run: |
+          kubectl create namespace ${{ env.NAMESPACE }} --dry-run=client -o yaml | kubectl apply -f -
+      
+      - name: Create Image Pull Secret
+        run: |
+          kubectl create secret docker-registry acr-secret \
+            --docker-server=${{ env.ACR_NAME }}.azurecr.io \
+            --docker-username=${{ secrets.ACR_USERNAME }} \
+            --docker-password=${{ secrets.ACR_PASSWORD }} \
+            --namespace=${{ env.NAMESPACE }} \
+            --dry-run=client -o yaml | kubectl apply -f -
+      
+      - name: Blue-Green Deployment to Production
+        uses: azure/k8s-deploy@v4
+        with:
+          namespace: ${{ env.NAMESPACE }}
+          manifests: |
+            k8s/namespace.yaml
+            k8s/configmap.yaml
+            k8s/secret.yaml
+            k8s/deployment.yaml
+            k8s/service.yaml
+            k8s/ingress.yaml
+            k8s/hpa.yaml
+            k8s/pdb.yaml
+            k8s/networkpolicy.yaml
+          images: |
+            ${{ env.ACR_NAME }}.azurecr.io/${{ env.APP_NAME }}:${{ github.sha }}
+          imagepullsecrets: |
+            acr-secret
+          strategy: blue-green
+          traffic-split-method: smi
+          route-method: service
+      
+      - name: Verify Production Deployment
+        run: |
+          kubectl rollout status deployment/${{ env.APP_NAME }} -n ${{ env.NAMESPACE }} --timeout=10m
+          kubectl get pods -n ${{ env.NAMESPACE }} -l app=${{ env.APP_NAME }}
+      
+      - name: Run Production Health Checks
+        run: |
+          for i in {1..10}; do
+            if curl -f https://app.company.com/actuator/health; then
+              echo "Health check passed"
+              exit 0
+            fi
+            echo "Attempt $i failed, retrying..."
+            sleep 10
+          done
+          exit 1
+      
+      - name: Promote Blue-Green Deployment
+        run: |
+          kubectl patch service ${{ env.APP_NAME }} -n ${{ env.NAMESPACE }} \
+            -p '{"spec":{"selector":{"version":"green"}}}'
+  
+  # ============================================================================
+  # JOB 8: POST-DEPLOYMENT VALIDATION & MONITORING
+  # ============================================================================
+  post-deployment:
+    name: Post-Deployment Validation
+    runs-on: ubuntu-latest
+    needs: deploy-production
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+      
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      
+      - name: Set AKS Context
+        uses: azure/aks-set-context@v3
+        with:
+          resource-group: ${{ env.AZURE_RESOURCE_GROUP }}
+          cluster-name: ${{ env.AKS_CLUSTER_NAME }}
+      
+      - name: DAST - Dynamic Application Security Testing
+        uses: zaproxy/action-full-scan@v0.7.0
+        with:
+          target: 'https://app.company.com'
+          rules_file_name: '.zap/rules.tsv'
+          cmd_options: '-a'
+      
+      - name: Performance Testing with K6
+        run: |
+          docker run --rm -i grafana/k6 run - <tests/load-test.js
+      
+      - name: Update Deployment Metrics
+        run: |
+          echo "Deployment completed at $(date)" >> deployment-log.txt
+          echo "Image: ${{ env.ACR_NAME }}.azurecr.io/${{ env.APP_NAME }}:${{ github.sha }}" >> deployment-log.txt
+      
+      - name: Notify Deployment Success
+        uses: 8398a7/action-slack@v3
+        if: success()
+        with:
+          status: custom
+          custom_payload: |
+            {
+              text: "✅ Production Deployment Successful",
+              attachments: [{
+                color: 'good',
+                text: `Deployed ${{ env.APP_NAME }}:${{ github.sha }} to production`
+              }]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+      
+      - name: Notify Deployment Failure
+        uses: 8398a7/action-slack@v3
+        if: failure()
+        with:
+          status: custom
+          custom_payload: |
+            {
+              text: "❌ Production Deployment Failed",
+              attachments: [{
+                color: 'danger',
+                text: `Failed to deploy ${{ env.APP_NAME }}:${{ github.sha }}`
+              }]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
